@@ -1,1 +1,1 @@
-web: gunicorn outvier_core.wsgi --log-file - 
+web: gunicorn outvier_core.wsgi --workers 1 --threads 2 --timeout 120 --log-file -
