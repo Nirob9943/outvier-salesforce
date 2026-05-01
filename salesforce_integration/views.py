@@ -1,60 +1,71 @@
 from django.utils import timezone
 from django.http import JsonResponse
-from simple_salesforce import Salesforce, SalesforceAuthenticationFailed
 from dotenv import load_dotenv
 from .models import StudentApplication, SyncLog
 import os
+import requests
 
 load_dotenv()
 
+SALESFORCE_INSTANCE = 'https://orgfarm-953ff40aa4-dev-ed.develop.my.salesforce.com'
 
-def get_salesforce_connection():
-    try:
-        sf = Salesforce(
-            username=os.getenv('SALESFORCE_USERNAME'),
-            password=os.getenv('SALESFORCE_PASSWORD'),
-            consumer_key=os.getenv('SALESFORCE_CLIENT_ID'),
-            consumer_secret=os.getenv('SALESFORCE_CLIENT_SECRET'),
-            domain=os.getenv('SALESFORCE_DOMAIN')
-        )
-        return sf
-    except SalesforceAuthenticationFailed as e:
-        print(f"Salesforce authentication failed: {e}")
-        return None
-    except Exception as e:
-        print(f"Salesforce connection error: {e}")
-        return None
+def get_salesforce_token():
+    url = f"{SALESFORCE_INSTANCE}/services/oauth2/token"
+    payload = {
+        'grant_type': 'client_credentials',
+        'client_id': os.getenv('SALESFORCE_CLIENT_ID'),
+        'client_secret': os.getenv('SALESFORCE_CLIENT_SECRET'),
+    }
+    response = requests.post(url, data=payload)
+    if response.status_code == 200:
+        return response.json().get('access_token')
+    return None
 
 
 def test_salesforce_connection(request):
-    sf = get_salesforce_connection()
-    if sf:
+    token = get_salesforce_token()
+    if token:
         return JsonResponse({
             'status': 'success',
             'message': 'Successfully connected to Salesforce',
-            'instance_url': sf.base_url
+            'instance_url': SALESFORCE_INSTANCE,
+            'token_preview': token[:20] + '...'
         })
-    else:
-        return JsonResponse({
-            'status': 'error',
-            'message': 'Failed to connect to Salesforce'
-        }, status=500)
+    return JsonResponse({
+        'status': 'error',
+        'message': 'Failed to connect to Salesforce'
+    }, status=500)
 
 
 def sync_salesforce_contacts(request):
-    sf = get_salesforce_connection()
-    if not sf:
+    token = get_salesforce_token()
+    if not token:
         return JsonResponse({
             'status': 'error',
             'message': 'Could not connect to Salesforce'
         }, status=500)
 
     try:
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json'
+        }
+
         # Query contacts from Salesforce
-        result = sf.query(
-            "SELECT Id, FirstName, LastName, Email FROM Contact LIMIT 10"
+        query = "SELECT Id, FirstName, LastName, Email FROM Contact LIMIT 10"
+        response = requests.get(
+            f"{SALESFORCE_INSTANCE}/services/data/v59.0/query/",
+            headers=headers,
+            params={'q': query}
         )
-        records = result.get('records', [])
+
+        if response.status_code != 200:
+            return JsonResponse({
+                'status': 'error',
+                'message': f'Salesforce query failed: {response.json()}'
+            }, status=500)
+
+        records = response.json().get('records', [])
         synced = 0
 
         for record in records:
@@ -67,7 +78,6 @@ def sync_salesforce_contacts(request):
             if not email:
                 continue
 
-            # Create or update student application
             obj, created = StudentApplication.objects.update_or_create(
                 salesforce_id=salesforce_id,
                 defaults={
@@ -83,7 +93,6 @@ def sync_salesforce_contacts(request):
             )
             synced += 1
 
-        # Log the sync
         SyncLog.objects.create(
             sync_status='success',
             records_synced=synced,
@@ -93,7 +102,14 @@ def sync_salesforce_contacts(request):
         return JsonResponse({
             'status': 'success',
             'message': f'Synced {synced} records from Salesforce',
-            'records_synced': synced
+            'records_synced': synced,
+            'records': [
+                {
+                    'id': r.get('Id'),
+                    'name': f"{r.get('FirstName','')} {r.get('LastName','')}".strip(),
+                    'email': r.get('Email', '')
+                } for r in records
+            ]
         })
 
     except Exception as e:
